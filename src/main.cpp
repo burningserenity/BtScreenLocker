@@ -114,7 +114,13 @@ int main(int argc, char *argv[])
         }
     }
 
-    ScreenLocker locker;
+    QString screenLockerCommand = parser.value("screen-locker");
+    if (!screenLockerCommand.isEmpty()) {
+        logger.log(QObject::tr("Using custom screen locker: %1").arg(screenLockerCommand),
+                   Q_FUNC_INFO, Logger::TYPE::INFO);
+    }
+
+    ScreenLocker locker(screenLockerCommand);
     Listener listener(locker, autorestart, seconds);
     a.connect(&listener, &Listener::lockScreen, &locker, &ScreenLocker::lockScreen);
     a.connect(&listener, &Listener::quit, &a, &QApplication::quit, Qt::QueuedConnection);
@@ -210,6 +216,14 @@ QList<QCommandLineOption> commandLineOptions(const char *name)
         QObject::tr("Same as --discover, but for an already running %1 instance.").arg(name))
     );
 
+    options.append(QCommandLineOption(QStringList() << "S" << "screen-locker",
+        QObject::tr("Screen locker command to run when trusted devices go away, instead of "
+                    "the default org.freedesktop.ScreenSaver DBus interface. "
+                    "Supports arguments, e.g. \"swaylock\", \"swaylock -f -c 000000\", \"i3lock -c 000000\". "
+                    "Recommended for Wayland/Sway users: swaylock."),
+        "command")
+    );
+
     options.append(QCommandLineOption(QStringList() << "t" << "time-to-restart",
         QObject::tr("Time to wait before auto-restarting %1. (Only useful when combined with -A)").arg(name),
         "seconds")
@@ -243,7 +257,7 @@ QTranslator *setAppLanguage(std::map<QString, Logger::TYPE> &logMessages, const 
     } else if (language == "en" or language == "english") {
         logMessages[QObject::tr("Language refers to default language: English.")] = Logger::INFO;
     } else {
-        logMessages[QObject::tr("Language: %1 currently not supported.").arg(language)] = Logger::ERROR;
+        logMessages[QObject::tr("Language: %1 currently not supported.").arg(language)] = Logger::INFO;
     }
 
     if (translator->language().isEmpty()) {
@@ -286,6 +300,10 @@ int enableAutostart(const QCommandLineParser &parser, Logger &logger, const char
         args << QString("-l %1").arg(parser.value("language"));
     }
 
+    if (parser.isSet("screen-locker")) {
+        args << QString("-S \"%1\"").arg(parser.value("screen-locker"));
+    }
+
     if (parser.isSet("verbose")) {
         args << "-V";
     }
@@ -296,43 +314,30 @@ int enableAutostart(const QCommandLineParser &parser, Logger &logger, const char
         a += QString(" %1").arg(s);
     }
 
-    contents.replace("/bin/BtScreenLocker", "/bin/BtScreenLocker" + a);
+    contents.replace("/bin/BtScreenLocker", QString("/bin/BtScreenLocker%1").arg(a));
 
-    filename = QString("%1%2%3%4%5")
-                   .arg(QStandardPaths::writableLocation(QStandardPaths::ConfigLocation),
-                        QDir::separator(),
-                        "autostart",
-                        QDir::separator(),
-                        AUTOSTART_FILE);
-
-    if (QFile::exists(filename)) {
-        logger.log(
-            QObject::tr("Warning! Overwriting old autostart configuration."),
-            Q_FUNC_INFO,
-            Logger::WARNING
-        );
+    QString autostartPath = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation)
+                            + "/autostart/";
+    QDir dir;
+    if (not dir.exists(autostartPath)) {
+        if (not dir.mkpath(autostartPath)) {
+            logger.log(QObject::tr("Couldn't create autostart directory. Can't continue."),
+                       Q_FUNC_INFO, Logger::ERROR);
+            return 1;
+        }
     }
 
-    file.close();
-    file.setFileName(filename);
-    if (not file.open(QIODevice::WriteOnly)) {
-        logger.log(
-            QObject::tr("Error while opening autostart file. Can't continue.\nError: %1").arg(file.errorString()),
-            Q_FUNC_INFO, Logger::ERROR
-        );
+    QFile autostartFile(autostartPath + "BtScreenLocker.desktop");
+    if (not autostartFile.open(QIODevice::WriteOnly)) {
+        logger.log(QObject::tr("Couldn't open autostart file for writing. Can't continue."),
+                   Q_FUNC_INFO, Logger::ERROR);
         return 1;
     }
 
-    file.write(QByteArray::fromStdString(contents.toStdString()));
-    if (not file.flush()) {
-        logger.log(
-            QObject::tr("Error while writing autostart file.\nError: %1").arg(file.errorString()),
-            Q_FUNC_INFO
-        );
-        return 1;
-    }
+    autostartFile.write(contents.toUtf8());
+    logger.log(QObject::tr("Autostart file written to: %1").arg(autostartPath + "BtScreenLocker.desktop"),
+               Q_FUNC_INFO);
 
-    logger.log(QObject::tr("%1 will autostart on boot!").arg(name), Q_FUNC_INFO);
     return 0;
 }
 
@@ -340,12 +345,12 @@ void registerDBusService(Listener &listener, Logger &logger)
 {
     auto connection = QDBusConnection::sessionBus();
     if (not connection.registerService(SERVICE_NAME)) {
-            logger.log(
-            QObject::tr("Couldn't register D-Bus service. Won't be able to respond to IPC messages.\n"
-                       "Error message: %1").arg(connection.lastError().message()),
-            Q_FUNC_INFO, Logger::ERROR);
-        return;
+        logger.log(QObject::tr("Couldn't register DBus service. Is another instance running?"),
+                   Q_FUNC_INFO, Logger::ERROR);
     }
 
-    connection.registerObject("/Listen", &listener, QDBusConnection::ExportScriptableSlots);
+    if (not connection.registerObject("/Listen", &listener)) {
+        logger.log(QObject::tr("Couldn't register DBus object."),
+                   Q_FUNC_INFO, Logger::ERROR);
+    }
 }
